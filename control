@@ -1,0 +1,9 @@
+Package: com.alex52525.infstam
+Name: InfinityStamina
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: Infinite stamina (port from Lua)
+Maintainer: you
+Author: @Alex52525
+Section: Tweaks
+Depends: mobilesubstrate
