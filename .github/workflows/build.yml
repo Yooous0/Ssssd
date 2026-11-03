@@ -1,29 +1,38 @@
 name: Build infstam dylib
-
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: macos-14
-
     steps:
-      - uses: actions/checkout@v4
-
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Install Theos
         uses: Randomblock1/theos-action@v1.5
-
       - name: Build
         run: |
           make clean || true
-          make package FINALPACKAGE=1
-
-      - name: Upload artifacts
+          make
+      - name: Find dylib
+        run: |
+          echo "Searching for infstam.dylib..."
+          DYLIB=$(find .theos -type f -name "infstam.dylib" | head -n 1)
+          if [ -z "$DYLIB" ]; then
+            echo "ERROR: infstam.dylib not found!"
+            echo "Available dylib files:"
+            find .theos -type f -name "*.dylib"
+            exit 1
+          fi
+          cp "$DYLIB" ./infstam.dylib
+          echo "Dylib successfully copied!"
+          ls -lh ./infstam.dylib
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: infstam-dylib
-          path: |
-            .theos/obj/**/*.dylib
-            packages/*.deb
+          path: infstam.dylib
+          if-no-files-found: error
+          compression-level: 0
