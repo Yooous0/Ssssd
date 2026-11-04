@@ -23,7 +23,7 @@ static uintptr_t g_base = 0;
 static volatile int g_stamina = 0;
 static volatile int g_hitbox  = 0;
 static uintptr_t g_hb_table   = 0;
-static UIWindow *g_overlay    = nil;
+static UIView *g_menuContainer = nil;
 
 static inline int32_t rd32(uintptr_t a){ return *(volatile int32_t*)a; }
 static inline void    wr32(uintptr_t a, int32_t v){ *(volatile int32_t*)a = v; }
@@ -57,7 +57,7 @@ static void apply_stamina(void) {
     if (ped) wr32((uintptr_t)ped + OFF_PED_INF_SPRINT, flag);
 }
 
-// ===== ХИТБОКСЫ =====
+// ===== ХИТБОКСЫ (СКАН) =====
 static int looks_like_hb(uintptr_t base) {
     for (int i = 0; i < HB_COUNT; i++) {
         float v = rdf32(base + i * HB_STEP);
@@ -111,19 +111,11 @@ static void start_ticker(void) {
         500ull * NSEC_PER_MSEC, 100ull * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(t, ^{
         if (g_stamina) apply_stamina();
-        // Пересоздаём overlay, если пропал
-        if (g_overlay && (g_overlay.hidden || g_overlay.windowLevel < UIWindowLevelAlert + 1000)) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                g_overlay.hidden = NO;
-                g_overlay.windowLevel = UIWindowLevelAlert + 1000;
-                [g_overlay makeKeyAndVisible];
-            });
-        }
     });
     dispatch_resume(t);
 }
 
-// ===== КАСТОМНЫЙ GUI =====
+// ===== КАСТОМНОЕ МЕНЮ (ВНУТРИ ОКНА ИГРЫ) =====
 @interface MenuView : UIView
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIButton *floatingBtn;
@@ -144,7 +136,7 @@ static void start_ticker(void) {
     self.backgroundColor = [UIColor clearColor];
     self.menuOpen = NO;
 
-    // --- Плавающая кнопка (логотип) ---
+    // Плавающая кнопка
     CGFloat btnSize = 44;
     self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingBtn.frame = CGRectMake(20, 100, btnSize, btnSize);
@@ -152,7 +144,6 @@ static void start_ticker(void) {
     self.floatingBtn.layer.shadowColor = [UIColor blackColor].CGColor;
     self.floatingBtn.layer.shadowOpacity = 0.5;
     self.floatingBtn.layer.shadowRadius = 4;
-    self.floatingBtn.layer.shadowOffset = CGSizeMake(0, 2);
     self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.15 alpha:0.95];
     self.floatingBtn.layer.borderWidth = 1.5;
     self.floatingBtn.layer.borderColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1].CGColor;
@@ -162,11 +153,10 @@ static void start_ticker(void) {
     [self.floatingBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatingBtn];
 
-    // Перетаскивание кнопки
     UIPanGestureRecognizer *panBtn = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanBtn:)];
     [self.floatingBtn addGestureRecognizer:panBtn];
 
-    // --- Панель меню ---
+    // Панель
     CGFloat panelW = 240;
     CGFloat panelH = 180;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, panelW, panelH)];
@@ -175,13 +165,11 @@ static void start_ticker(void) {
     self.panel.layer.shadowColor = [UIColor blackColor].CGColor;
     self.panel.layer.shadowOpacity = 0.6;
     self.panel.layer.shadowRadius = 10;
-    self.panel.layer.shadowOffset = CGSizeMake(0, 4);
     self.panel.layer.borderWidth = 1;
     self.panel.layer.borderColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:0.6].CGColor;
     self.panel.hidden = YES;
     [self addSubview:self.panel];
 
-    // Заголовок
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, panelW - 32, 22)];
     title.text = @"NONERAI";
     title.textColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1];
@@ -194,12 +182,10 @@ static void start_ticker(void) {
     sub.font = [UIFont systemFontOfSize:11];
     [self.panel addSubview:sub];
 
-    // Разделитель
     UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(12, 56, panelW - 24, 1)];
     sep.backgroundColor = [UIColor colorWithWhite:1 alpha:0.1];
     [self.panel addSubview:sep];
 
-    // Свитч 1: НФТ бег
     UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(16, 72, 140, 24)];
     l1.text = @"НФТ бег";
     l1.textColor = [UIColor whiteColor];
@@ -211,7 +197,6 @@ static void start_ticker(void) {
     [self.swStamina addTarget:self action:@selector(toggleStamina:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.swStamina];
 
-    // Свитч 2: Хитбоксы
     UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(16, 112, 140, 24)];
     l2.text = @"Хитбоксы";
     l2.textColor = [UIColor whiteColor];
@@ -223,15 +208,12 @@ static void start_ticker(void) {
     [self.swHitbox addTarget:self action:@selector(toggleHitbox:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.swHitbox];
 
-    // Индикатор статуса
     UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(16, panelH - 26, panelW - 32, 16)];
     status.text = [NSString stringWithFormat:@"base: 0x%lx", (unsigned long)g_base];
     status.textColor = [UIColor colorWithWhite:0.5 alpha:1];
     status.font = [UIFont systemFontOfSize:10];
-    status.tag = 999;
     [self.panel addSubview:status];
 
-    // Перетаскивание панели
     UIPanGestureRecognizer *panPanel = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanPanel:)];
     [self.panel addGestureRecognizer:panPanel];
 }
@@ -240,7 +222,6 @@ static void start_ticker(void) {
     self.menuOpen = !self.menuOpen;
     self.panel.hidden = !self.menuOpen;
     if (self.menuOpen) {
-        // Позиционируем панель под кнопкой
         CGRect btn = self.floatingBtn.frame;
         self.panel.frame = CGRectMake(btn.origin.x, btn.origin.y + btn.size.height + 10, 240, 180);
     }
@@ -288,29 +269,33 @@ static void start_ticker(void) {
 
 @end
 
-// ===== OVERLAY =====
+// ===== УСТАНОВКА МЕНЮ В ОКНО ИГРЫ =====
 static MenuView *g_menu = nil;
 
-static void setup_overlay(void) {
+static void attach_menu_to_game(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!UIApplication.sharedApplication) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), ^{ setup_overlay(); });
+        // Ищем keyWindow игры
+        UIWindow *gameWindow = nil;
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if (w.isKeyWindow) { gameWindow = w; break; }
+        }
+        
+        if (!gameWindow) {
+            // Ждём дальше
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{ attach_menu_to_game(); });
             return;
         }
 
-        g_overlay = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-        g_overlay.windowLevel = UIWindowLevelAlert + 1000;
-        g_overlay.backgroundColor = [UIColor clearColor];
-        g_overlay.rootViewController = [UIViewController new];
-        g_overlay.hidden = NO;
-        [g_overlay makeKeyAndVisible];
-
-        g_menu = [[MenuView alloc] initWithFrame:g_overlay.rootViewController.view.bounds];
+        // Создаём меню и добавляем ПРЯМО в окно игры
+        g_menu = [[MenuView alloc] initWithFrame:gameWindow.bounds];
         g_menu.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [g_overlay.rootViewController.view addSubview:g_menu];
+        [gameWindow addSubview:g_menu];
+        
+        // Поднимаем на самый верх
+        [gameWindow bringSubviewToFront:g_menu];
 
-        NSLog(@"[NONERAI] Overlay OK, base=0x%lx", (unsigned long)g_base);
+        NSLog(@"[NONERAI] Menu attached to game window, base=0x%lx", (unsigned long)g_base);
     });
 }
 
@@ -321,11 +306,9 @@ static void init_all(void) {
     NSLog(@"[NONERAI] base = 0x%lx", (unsigned long)g_base);
     if (!g_base) { NSLog(@"[NONERAI] base not found"); return; }
 
-    int32_t test = rd32(g_base + OFF_LOCAL_PLAYER_ID);
-    NSLog(@"[NONERAI] stamina TEST raw = %d (id=%d)", test, test % 65536);
-
     start_ticker();
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{ setup_overlay(); });
+    // Пытаемся прикрепить меню через 3 секунды (когда игра загрузится)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ attach_menu_to_game(); });
 }
