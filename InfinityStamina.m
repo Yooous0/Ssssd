@@ -9,10 +9,16 @@ static uintptr_t g_base = 0;
 static UITextView *g_logView = nil;
 static UILabel *g_statsLabel = nil;
 
-// Переменные для статистики
+static uintptr_t g_world_offset = 0;
 static uintptr_t g_id_offset = 0;
+static volatile int g_stamina = 0;
 static volatile int g_current_id = 0;
 static NSTimeInterval g_session_start = 0;
+
+// Смещения из скрипта
+#define STRIDE                0xF8
+#define OFF_INF_SPRINT        0xE8
+#define OFF_PED_INF_SPRINT    0x85F
 
 static void LogToMenu(NSString *fmt, ...) {
     va_list args; va_start(args, fmt);
@@ -39,69 +45,81 @@ static uintptr_t find_main_base(void) {
 }
 
 static inline int32_t rd32(uintptr_t a){ return *(volatile int32_t*)a; }
+static inline void    wr32(uintptr_t a, int32_t v){ *(volatile int32_t*)a = v; }
 static inline int64_t rd64(uintptr_t a){ return *(volatile int64_t*)a; }
 
-// ===== ПАТЧ СТАМИНЫ =====
-static void patch_stamina(void) {
+// ===== БЕЗОПАСНЫЙ ПОИСК СТРУКТУРЫ ИГРОКА =====
+static void find_player_structures(void) {
     if (!g_base) return;
-    uintptr_t patch_addr = g_base + 0x123708;
-    vm_protect(mach_task_self(), patch_addr & ~0xFFF, 0x1000, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    *(volatile uint32_t*)patch_addr = 0x52800000; // MOV W0, #1
-    vm_protect(mach_task_self(), patch_addr & ~0xFFF, 0x1000, false, VM_PROT_READ | VM_PROT_EXECUTE);
-    LogToMenu(@"[PATCH] Стамина включена (0x%lx)", patch_addr);
-}
-
-// ===== ПОИСК ID ИГРОКА =====
-static void find_player_id(void) {
-    if (!g_base) return;
-    LogToMenu(@"[SCAN] Ищу ID игрока...");
+    LogToMenu(@"[SCAN] Ищу структуру (это займет пару секунд)...");
     
-    // Ищем указатель на мир в районе 0x3100000 (где он был у тебя)
-    for (uintptr_t offset = 0x3000000; offset < 0x3300000; offset += 8) {
-        @try {
-            int64_t world_ptr = rd64(g_base + offset);
-            if (world_ptr < 0x100000000 || world_ptr > 0x7FFFFFFFFF) continue;
-            
-            int32_t raw_id = rd32(g_base + offset + 8);
-            int32_t id = raw_id % 65536;
-            
-            // Если ID от 0 до 2000 (адекватный)
-            if (id > 0 && id < 2000) {
-                // Проверяем, есть ли массив
-                uintptr_t test_info = (uintptr_t)world_ptr + (id * 0xF8);
-                int64_t test_ped = rd64(test_info);
-                if (test_ped > 0x100000000 && test_ped < 0x7FFFFFFFFF) {
-                    g_id_offset = offset + 8; // Запоминаем, где лежит именно ID
-                    LogToMenu(@"[SCAN] УСПЕХ! ID найден. Оффсет: 0x%lx", g_id_offset);
-                    return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // Сканируем область, где VansonLoader видел ID и мир (0x3000000 - 0x3300000)
+        for (uintptr_t offset = 0x3000000; offset < 0x3300000; offset += 8) {
+            @try {
+                int64_t world_ptr = rd64(g_base + offset);
+                if (world_ptr < 0x100000000 || world_ptr > 0x7FFFFFFFFF) continue;
+                
+                int32_t raw_id = rd32(g_base + offset + 8);
+                int32_t id = raw_id % 65536;
+                
+                // ID должен быть от 1 до 2000
+                if (id > 0 && id < 2000) {
+                    uintptr_t test_info = (uintptr_t)world_ptr + (id * STRIDE);
+                    int64_t test_ped = rd64(test_info);
+                    
+                    // Проверяем, что по этому адресу лежит валидный указатель на педа
+                    if (test_ped > 0x100000000 && test_ped < 0x7FFFFFFFFF) {
+                        g_world_offset = offset;
+                        g_id_offset = offset + 8;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            LogToMenu(@"[SCAN] УСПЕХ! Найден ID: %d", id);
+                            LogToMenu(@"[SCAN] World оффсет: 0x%lx", offset);
+                        });
+                        return;
+                    }
                 }
-            }
-        } @catch (NSException *e) {}
-    }
-    LogToMenu(@"[SCAN] ID не найден (ищи в игре).");
+            } @catch (NSException *e) {}
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LogToMenu(@"[SCAN] Не найдено. Ты на сервере?");
+        });
+    });
 }
 
-// ===== ОБНОВЛЕНИЕ СТАТИСТИКИ =====
-static void update_stats(void) {
-    if (!g_base || g_id_offset == 0) return;
+// ===== ПРИМЕНЕНИЕ СТАМИНЫ =====
+static void apply_stamina(void) {
+    if (!g_base || g_world_offset == 0) return;
     @try {
-        int32_t raw = rd32(g_base + g_id_offset);
-        if (raw > 0) {
-            g_current_id = raw % 65536;
+        int64_t world_ptr = rd64(g_base + g_world_offset);
+        if (world_ptr <= 0) return;
+
+        int32_t raw_id = rd32(g_base + g_id_offset);
+        int32_t id = raw_id % 65536;
+        
+        uintptr_t info = (uintptr_t)world_ptr + (id * STRIDE);
+        
+        // Пишем флаг в таблицу игроков
+        wr32(info + OFF_INF_SPRINT, 1);
+        
+        // Пишем флаг в педа
+        int64_t ped = rd64(info);
+        if (ped > 0x100000000 && ped < 0x7FFFFFFFFF) {
+            wr32((uintptr_t)ped + OFF_PED_INF_SPRINT, 1);
         }
     } @catch (NSException *e) {}
 }
 
-static void start_stats_ticker(void) {
-    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 500ull * NSEC_PER_MSEC, 100ull * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(t, ^{
-        update_stats();
-        if (g_statsLabel) {
-            NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:[NSDate dateWithTimeIntervalSince1970:g_session_start]];
-            int mins = (int)elapsed / 60;
-            int secs = (int)elapsed % 60;
-            g_statsLabel.text = [NSString stringWithFormat:@"ID: %d  |  ВСР: %02d:%02d", g_current_id, mins, secs];
+static void start_ticker(void) {
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0));
+    // Таймер бьет каждые 30 мс (быстро, чтобы обгонять игру)
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 30ull * NSEC_PER_MSEC, 10ull * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{ 
+        if (g_stamina) apply_stamina(); 
+        
+        // Обновление статистики
+        if (g_id_offset != 0) {
+            g_current_id = rd32(g_base + g_id_offset) % 65536;
         }
     });
     dispatch_resume(t);
@@ -111,6 +129,7 @@ static void start_stats_ticker(void) {
 @interface MenuView : UIView
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIButton *floatingBtn;
+@property (nonatomic, strong) UISwitch *swStamina;
 @property (nonatomic, assign) BOOL menuOpen;
 @end
 
@@ -149,12 +168,11 @@ static void start_stats_ticker(void) {
     [self.panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanPanel:)]];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, panelW - 32, 22)];
-    title.text = @"NONERAI STATS";
+    title.text = @"NONERAI STABLE";
     title.textColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1];
     title.font = [UIFont boldSystemFontOfSize:16];
     [self.panel addSubview:title];
 
-    // Плашка со статистикой
     g_statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 40, panelW - 32, 30)];
     g_statsLabel.text = @"ID: ---  |  ВСР: 00:00";
     g_statsLabel.textColor = [UIColor whiteColor];
@@ -165,23 +183,23 @@ static void start_stats_ticker(void) {
     g_statsLabel.layer.masksToBounds = YES;
     [self.panel addSubview:g_statsLabel];
 
-    UIButton *patchBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    patchBtn.frame = CGRectMake(16, 80, panelW - 32, 36);
-    [patchBtn setTitle:@"Включить НФТ бег" forState:UIControlStateNormal];
-    [patchBtn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
-    patchBtn.layer.borderWidth = 1;
-    patchBtn.layer.borderColor = [UIColor greenColor].CGColor;
-    patchBtn.layer.cornerRadius = 8;
-    [patchBtn addTarget:self action:@selector(doPatch) forControlEvents:UIControlEventTouchUpInside];
-    [self.panel addSubview:patchBtn];
+    self.swStamina = [[UISwitch alloc] initWithFrame:CGRectMake(16, 80, 51, 31)];
+    self.swStamina.transform = CGAffineTransformMakeScale(0.8, 0.8);
+    [self.swStamina addTarget:self action:@selector(toggleStamina:) forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:self.swStamina];
+
+    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(70, 85, 140, 24)];
+    l1.text = @"НФТ бег";
+    l1.textColor = [UIColor whiteColor];
+    [self.panel addSubview:l1];
 
     UIButton *scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     scanBtn.frame = CGRectMake(16, 126, panelW - 32, 36);
-    [scanBtn setTitle:@"Найти ID" forState:UIControlStateNormal];
-    [scanBtn setTitleColor:[UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1] forState:UIControlStateNormal];
     scanBtn.layer.borderWidth = 1;
     scanBtn.layer.borderColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:0.5].CGColor;
     scanBtn.layer.cornerRadius = 8;
+    [scanBtn setTitle:@"Найти ID (в игре)" forState:UIControlStateNormal];
+    [scanBtn setTitleColor:[UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1] forState:UIControlStateNormal];
     [scanBtn addTarget:self action:@selector(doScan) forControlEvents:UIControlEventTouchUpInside];
     [self.panel addSubview:scanBtn];
 
@@ -195,11 +213,11 @@ static void start_stats_ticker(void) {
     [self.panel addSubview:g_logView];
 }
 
-- (void)doPatch { patch_stamina(); }
-- (void)doScan { find_player_id(); }
+- (void)doScan { find_player_structures(); }
 - (void)toggleMenu { self.menuOpen = !self.menuOpen; self.panel.hidden = !self.menuOpen; if (self.menuOpen) { CGRect b = self.floatingBtn.frame; self.panel.frame = CGRectMake(b.origin.x, b.origin.y + b.size.height + 10, 280, 250); } }
 - (void)handlePanBtn:(UIPanGestureRecognizer*)g { CGPoint t = [g translationInView:self]; self.floatingBtn.center = CGPointMake(self.floatingBtn.center.x + t.x, self.floatingBtn.center.y + t.y); [g setTranslation:CGPointZero inView:self]; if (self.menuOpen) { CGRect b = self.floatingBtn.frame; self.panel.frame = CGRectMake(b.origin.x, b.origin.y + b.size.height + 10, 280, 250); } }
 - (void)handlePanPanel:(UIPanGestureRecognizer*)g { CGPoint t = [g translationInView:self]; self.panel.center = CGPointMake(self.panel.center.x + t.x, self.panel.center.y + t.y); [g setTranslation:CGPointZero inView:self]; }
+- (void)toggleStamina:(UISwitch*)s { g_stamina = s.isOn ? 1 : 0; LogToMenu(@"[MENU] Stamina %@", s.isOn ? @"ON" : @"OFF"); if(g_stamina) apply_stamina(); }
 @end
 
 static MenuView *g_menu = nil;
@@ -213,14 +231,22 @@ static void attach_menu_to_game(void) {
         [gameWindow addSubview:g_menu];
         [gameWindow bringSubviewToFront:g_menu];
         g_session_start = [[NSDate date] timeIntervalSince1970];
-        LogToMenu(@"[NONERAI] Меню загружено.");
+        
+        // Обновляем время каждую секунду
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+            if (g_statsLabel) {
+                NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:[NSDate dateWithTimeIntervalSince1970:g_session_start]];
+                int mins = (int)elapsed / 60;
+                int secs = (int)elapsed % 60;
+                g_statsLabel.text = [NSString stringWithFormat:@"ID: %d  |  ВСР: %02d:%02d", g_current_id, mins, secs];
+            }
+        }];
     });
 }
 
 __attribute__((constructor))
 static void init_all(void) {
     g_base = find_main_base();
-    patch_stamina(); // Патчим стамину при старте
-    start_stats_ticker();
+    start_ticker();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ attach_menu_to_game(); });
 }
