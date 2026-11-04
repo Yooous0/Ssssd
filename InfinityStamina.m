@@ -17,20 +17,20 @@
 #define HB_COUNT      10
 #define HB_MIN        0.05f
 #define HB_MAX        0.35f
-#define HB_MULT       6.0f
+#define HB_MULT       2.0f
 
 static uintptr_t g_base = 0;
 static volatile int g_stamina = 0;
 static volatile int g_hitbox  = 0;
 static uintptr_t g_hb_table   = 0;
-static UIView *g_menuContainer = nil;
+static float     g_hb_orig[HB_COUNT];
 
 static inline int32_t rd32(uintptr_t a){ return *(volatile int32_t*)a; }
 static inline void    wr32(uintptr_t a, int32_t v){ *(volatile int32_t*)a = v; }
 static inline float   rdf32(uintptr_t a){ return *(volatile float*)a; }
 static inline void    wrf32(uintptr_t a, float v){ *(volatile float*)a = v; }
 
-// ===== БАЗА ИГРЫ =====
+// ===== БАЗА =====
 static uintptr_t find_main_base(void) {
     char path[4096];
     uint32_t size = sizeof(path);
@@ -44,20 +44,33 @@ static uintptr_t find_main_base(void) {
     return 0;
 }
 
-// ===== СТАМИНА =====
+// ===== СТАМИНА (с проверками) =====
 static void apply_stamina(void) {
     if (!g_base) return;
+
     int32_t raw = rd32(g_base + OFF_LOCAL_PLAYER_ID);
-    if (!raw) return;
+    if (!raw || raw < 0) return;
+
     int32_t id = raw % 65536;
+    if (id < 0 || id > 1000) return; // разумный ID
+
     uintptr_t info = g_base + OFF_WORLD_PLAYERS + (uintptr_t)id * STRIDE;
+    if (info < g_base || info > g_base + 0x20000000) return;
+
     int32_t ped = rd32(info);
     int32_t flag = g_stamina ? 1 : 0;
-    wr32(info + OFF_INF_SPRINT, flag);
-    if (ped) wr32((uintptr_t)ped + OFF_PED_INF_SPRINT, flag);
+
+    @try {
+        wr32(info + OFF_INF_SPRINT, flag);
+        if (ped && ped > 0x10000000 && ped < 0x7FFFFFFF) {
+            wr32((uintptr_t)ped + OFF_PED_INF_SPRINT, flag);
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[InfStamina] crash prevented: %@", e);
+    }
 }
 
-// ===== ХИТБОКСЫ (СКАН) =====
+// ===== ХИТБОКСЫ (безопасный скан) =====
 static int looks_like_hb(uintptr_t base) {
     for (int i = 0; i < HB_COUNT; i++) {
         float v = rdf32(base + i * HB_STEP);
@@ -76,6 +89,7 @@ static uintptr_t scan_hitbox_table(void) {
     uintptr_t start = g_base;
     uintptr_t end   = g_base + 0x20000000;
     uintptr_t a = start & ~0xFFF;
+
     while (a < end) {
         for (uintptr_t p = a; p + HB_COUNT * HB_STEP < a + 0x10000; p += 4) {
             @try {
@@ -90,13 +104,21 @@ static uintptr_t scan_hitbox_table(void) {
     return 0;
 }
 
-static void apply_hitbox(void) {
+static void apply_hitbox(int on) {
     if (!g_hb_table) return;
+    if (g_hb_table < g_base || g_hb_table > g_base + 0x20000000) return;
+
     for (int i = 0; i < HB_COUNT; i++) {
         uintptr_t addr = g_hb_table + i * HB_STEP;
-        float orig = rdf32(addr);
-        if (g_hitbox) {
-            if (orig > 0.01f && orig < 1.0f) wrf32(addr, orig * HB_MULT);
+        @try {
+            if (on) {
+                if (g_hb_orig[i] == 0) g_hb_orig[i] = rdf32(addr);
+                wrf32(addr, g_hb_orig[i] * HB_MULT);
+            } else {
+                if (g_hb_orig[i] > 0) wrf32(addr, g_hb_orig[i]);
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[HB] write fail 0x%lx", (unsigned long)addr);
         }
     }
 }
@@ -115,7 +137,7 @@ static void start_ticker(void) {
     dispatch_resume(t);
 }
 
-// ===== КАСТОМНОЕ МЕНЮ (ВНУТРИ ОКНА ИГРЫ) =====
+// ===== МЕНЮ =====
 @interface MenuView : UIView
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIButton *floatingBtn;
@@ -132,11 +154,23 @@ static void start_ticker(void) {
     return self;
 }
 
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    // Пропускаем касания мимо кнопки и панели
+    if (self.floatingBtn && !self.floatingBtn.hidden) {
+        CGPoint p = [self convertPoint:point toView:self.floatingBtn];
+        if ([self.floatingBtn pointInside:p withEvent:event]) return YES;
+    }
+    if (self.panel && !self.panel.hidden) {
+        CGPoint p = [self convertPoint:point toView:self.panel];
+        if ([self.panel pointInside:p withEvent:event]) return YES;
+    }
+    return NO;
+}
+
 - (void)setup {
     self.backgroundColor = [UIColor clearColor];
     self.menuOpen = NO;
 
-    // Плавающая кнопка
     CGFloat btnSize = 44;
     self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingBtn.frame = CGRectMake(20, 100, btnSize, btnSize);
@@ -156,9 +190,7 @@ static void start_ticker(void) {
     UIPanGestureRecognizer *panBtn = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanBtn:)];
     [self.floatingBtn addGestureRecognizer:panBtn];
 
-    // Панель
-    CGFloat panelW = 240;
-    CGFloat panelH = 180;
+    CGFloat panelW = 240, panelH = 180;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, panelW, panelH)];
     self.panel.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.10 alpha:0.96];
     self.panel.layer.cornerRadius = 14;
@@ -255,60 +287,52 @@ static void start_ticker(void) {
         if (!g_hb_table) {
             NSLog(@"[HB] scanning...");
             g_hb_table = scan_hitbox_table();
+            if (g_hb_table) {
+                for (int i = 0; i < HB_COUNT; i++) g_hb_orig[i] = 0;
+            }
         }
         if (g_hb_table) {
-            apply_hitbox();
+            apply_hitbox(1);
             NSLog(@"[HB] ON, table=0x%lx", (unsigned long)g_hb_table);
         } else {
             NSLog(@"[HB] table not found");
         }
     } else {
+        apply_hitbox(0);
         NSLog(@"[HB] OFF");
     }
 }
 
 @end
 
-// ===== УСТАНОВКА МЕНЮ В ОКНО ИГРЫ =====
+// ===== ПРИКРЕПЛЕНИЕ К ИГРЕ =====
 static MenuView *g_menu = nil;
 
 static void attach_menu_to_game(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // Ищем keyWindow игры
         UIWindow *gameWindow = nil;
         for (UIWindow *w in UIApplication.sharedApplication.windows) {
             if (w.isKeyWindow) { gameWindow = w; break; }
         }
-        
         if (!gameWindow) {
-            // Ждём дальше
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{ attach_menu_to_game(); });
             return;
         }
-
-        // Создаём меню и добавляем ПРЯМО в окно игры
         g_menu = [[MenuView alloc] initWithFrame:gameWindow.bounds];
         g_menu.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [gameWindow addSubview:g_menu];
-        
-        // Поднимаем на самый верх
         [gameWindow bringSubviewToFront:g_menu];
-
-        NSLog(@"[NONERAI] Menu attached to game window, base=0x%lx", (unsigned long)g_base);
+        NSLog(@"[NONERAI] Menu attached, base=0x%lx", (unsigned long)g_base);
     });
 }
 
-// ===== СТАРТ =====
 __attribute__((constructor))
 static void init_all(void) {
     g_base = find_main_base();
     NSLog(@"[NONERAI] base = 0x%lx", (unsigned long)g_base);
-    if (!g_base) { NSLog(@"[NONERAI] base not found"); return; }
-
+    if (!g_base) return;
     start_ticker();
-
-    // Пытаемся прикрепить меню через 3 секунды (когда игра загрузится)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{ attach_menu_to_game(); });
 }
