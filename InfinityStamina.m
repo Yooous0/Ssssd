@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach-o/dyld.h>
-#import <mach/mach.h>
 #import <string.h>
 #import <dispatch/dispatch.h>
 
@@ -9,16 +8,11 @@ static uintptr_t g_base = 0;
 static UITextView *g_logView = nil;
 static UILabel *g_statsLabel = nil;
 
-static uintptr_t g_world_offset = 0;
-static uintptr_t g_id_offset = 0;
+static uintptr_t OFF_LOCAL_PLAYER_ID = 0x31F17E8;
+static uintptr_t g_stamina_addr = 0; // Сюда запишется адрес стамины
+
 static volatile int g_stamina = 0;
 static volatile int g_current_id = 0;
-static NSTimeInterval g_session_start = 0;
-
-// Смещения из скрипта
-#define STRIDE                0xF8
-#define OFF_INF_SPRINT        0xE8
-#define OFF_PED_INF_SPRINT    0x85F
 
 static void LogToMenu(NSString *fmt, ...) {
     va_list args; va_start(args, fmt);
@@ -44,88 +38,63 @@ static uintptr_t find_main_base(void) {
     return 0;
 }
 
-static inline int32_t rd32(uintptr_t a){ return *(volatile int32_t*)a; }
-static inline void    wr32(uintptr_t a, int32_t v){ *(volatile int32_t*)a = v; }
-static inline int64_t rd64(uintptr_t a){ return *(volatile int64_t*)a; }
+static inline int16_t rd16(uintptr_t a){ return *(volatile int16_t*)a; }
+static inline float   rdf32(uintptr_t a){ return *(volatile float*)a; }
+static inline void    wrf32(uintptr_t a, float v){ *(volatile float*)a = v; }
 
-// ===== БЕЗОПАСНЫЙ ПОИСК СТРУКТУРЫ ИГРОКА =====
-static void find_player_structures(void) {
+// ===== УМНЫЙ ПОИСК СТАМИНЫ РЯДОМ С ID =====
+static void find_stamina(void) {
     if (!g_base) return;
-    LogToMenu(@"[SCAN] Ищу структуру (это займет пару секунд)...");
+    LogToMenu(@"[SCAN] Ищу стамину (float 1-100) рядом с ID...");
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // Сканируем область, где VansonLoader видел ID и мир (0x3000000 - 0x3300000)
-        for (uintptr_t offset = 0x3000000; offset < 0x3300000; offset += 8) {
+        uintptr_t id_addr = g_base + OFF_LOCAL_PLAYER_ID;
+        
+        // Сканируем 4 КБ памяти вокруг твоего ID
+        for (int offset = -0x1000; offset < 0x1000; offset += 4) {
+            uintptr_t check_addr = id_addr + offset;
             @try {
-                int64_t world_ptr = rd64(g_base + offset);
-                if (world_ptr < 0x100000000 || world_ptr > 0x7FFFFFFFFF) continue;
-                
-                int32_t raw_id = rd32(g_base + offset + 8);
-                int32_t id = raw_id % 65536;
-                
-                // ID должен быть от 1 до 2000
-                if (id > 0 && id < 2000) {
-                    uintptr_t test_info = (uintptr_t)world_ptr + (id * STRIDE);
-                    int64_t test_ped = rd64(test_info);
-                    
-                    // Проверяем, что по этому адресу лежит валидный указатель на педа
-                    if (test_ped > 0x100000000 && test_ped < 0x7FFFFFFFFF) {
-                        g_world_offset = offset;
-                        g_id_offset = offset + 8;
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            LogToMenu(@"[SCAN] УСПЕХ! Найден ID: %d", id);
-                            LogToMenu(@"[SCAN] World оффсет: 0x%lx", offset);
-                        });
-                        return;
-                    }
+                float val = rdf32(check_addr);
+                // Ищем дробное число, похожее на стамину (от 1.0 до 100.0)
+                if (val >= 1.0f && val <= 100.0f) {
+                    g_stamina_addr = check_addr;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        LogToMenu(@"[SCAN] Найдена стамина: %.1f", val);
+                        LogToMenu(@"[SCAN] Включи свитч!");
+                    });
+                    return;
                 }
             } @catch (NSException *e) {}
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            LogToMenu(@"[SCAN] Не найдено. Ты на сервере?");
+            LogToMenu(@"[SCAN] Не нашел. Поищи через VansonLoader.");
         });
     });
 }
 
-// ===== ПРИМЕНЕНИЕ СТАМИНЫ =====
-static void apply_stamina(void) {
-    if (!g_base || g_world_offset == 0) return;
+// ===== ПРОЦЕСС =====
+static void process_memory(void) {
+    if (!g_base) return;
     @try {
-        int64_t world_ptr = rd64(g_base + g_world_offset);
-        if (world_ptr <= 0) return;
-
-        int32_t raw_id = rd32(g_base + g_id_offset);
-        int32_t id = raw_id % 65536;
+        // Читаем ID (16 бит)
+        int16_t id = rd16(g_base + OFF_LOCAL_PLAYER_ID);
+        if (id > 0 && id < 2000) g_current_id = id;
         
-        uintptr_t info = (uintptr_t)world_ptr + (id * STRIDE);
-        
-        // Пишем флаг в таблицу игроков
-        wr32(info + OFF_INF_SPRINT, 1);
-        
-        // Пишем флаг в педа
-        int64_t ped = rd64(info);
-        if (ped > 0x100000000 && ped < 0x7FFFFFFFFF) {
-            wr32((uintptr_t)ped + OFF_PED_INF_SPRINT, 1);
+        // Если свитч включен — замораживаем стамину
+        if (g_stamina && g_stamina_addr != 0) {
+            wrf32(g_stamina_addr, 100.0f);
         }
     } @catch (NSException *e) {}
 }
 
 static void start_ticker(void) {
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0));
-    // Таймер бьет каждые 30 мс (быстро, чтобы обгонять игру)
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 30ull * NSEC_PER_MSEC, 10ull * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(t, ^{ 
-        if (g_stamina) apply_stamina(); 
-        
-        // Обновление статистики
-        if (g_id_offset != 0) {
-            g_current_id = rd32(g_base + g_id_offset) % 65536;
-        }
-    });
+    dispatch_source_set_event_handler(t, ^{ process_memory(); });
     dispatch_resume(t);
 }
 
-// ===== МЕНЮ =====
+// ===== МЕНЮ (ТЕМНО-БЕЛЫЙ СТИЛЬ) =====
 @interface MenuView : UIView
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIButton *floatingBtn;
@@ -143,38 +112,41 @@ static void start_ticker(void) {
 
 - (void)setup {
     self.backgroundColor = [UIColor clearColor];
+    
+    // Плавающая кнопка
     CGFloat btnSize = 44;
     self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingBtn.frame = CGRectMake(20, 100, btnSize, btnSize);
     self.floatingBtn.layer.cornerRadius = btnSize / 2;
-    self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.15 alpha:0.95];
-    self.floatingBtn.layer.borderWidth = 1.5;
-    self.floatingBtn.layer.borderColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1].CGColor;
+    self.floatingBtn.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
+    self.floatingBtn.layer.borderWidth = 1.0;
+    self.floatingBtn.layer.borderColor = [UIColor colorWithWhite:0.8 alpha:1.0].CGColor;
     [self.floatingBtn setTitle:@"N" forState:UIControlStateNormal];
-    [self.floatingBtn setTitleColor:[UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1] forState:UIControlStateNormal];
+    [self.floatingBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.floatingBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     [self.floatingBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.floatingBtn];
     [self.floatingBtn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanBtn:)]];
 
+    // Панель
     CGFloat panelW = 280, panelH = 250;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(20, 160, panelW, panelH)];
-    self.panel.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.10 alpha:0.96];
+    self.panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
     self.panel.layer.cornerRadius = 14;
     self.panel.layer.borderWidth = 1;
-    self.panel.layer.borderColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:0.6].CGColor;
+    self.panel.layer.borderColor = [UIColor colorWithWhite:0.4 alpha:1.0].CGColor;
     self.panel.hidden = YES;
     [self addSubview:self.panel];
     [self.panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanPanel:)]];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, panelW - 32, 22)];
-    title.text = @"NONERAI STABLE";
-    title.textColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1];
+    title.text = @"NOIR CLIENT";
+    title.textColor = [UIColor whiteColor];
     title.font = [UIFont boldSystemFontOfSize:16];
     [self.panel addSubview:title];
 
     g_statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 40, panelW - 32, 30)];
-    g_statsLabel.text = @"ID: ---  |  ВСР: 00:00";
+    g_statsLabel.text = @"ID: ---";
     g_statsLabel.textColor = [UIColor whiteColor];
     g_statsLabel.font = [UIFont fontWithName:@"Menlo-Bold" size:14] ?: [UIFont boldSystemFontOfSize:14];
     g_statsLabel.backgroundColor = [UIColor colorWithWhite:1 alpha:0.1];
@@ -185,27 +157,27 @@ static void start_ticker(void) {
 
     self.swStamina = [[UISwitch alloc] initWithFrame:CGRectMake(16, 80, 51, 31)];
     self.swStamina.transform = CGAffineTransformMakeScale(0.8, 0.8);
+    self.swStamina.onTintColor = [UIColor whiteColor];
     [self.swStamina addTarget:self action:@selector(toggleStamina:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.swStamina];
-
     UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(70, 85, 140, 24)];
     l1.text = @"НФТ бег";
     l1.textColor = [UIColor whiteColor];
     [self.panel addSubview:l1];
 
     UIButton *scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    scanBtn.frame = CGRectMake(16, 126, panelW - 32, 36);
+    scanBtn.frame = CGRectMake(16, 120, panelW - 32, 36);
     scanBtn.layer.borderWidth = 1;
-    scanBtn.layer.borderColor = [UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:0.5].CGColor;
+    scanBtn.layer.borderColor = [UIColor colorWithWhite:0.6 alpha:0.5].CGColor;
     scanBtn.layer.cornerRadius = 8;
-    [scanBtn setTitle:@"Найти ID (в игре)" forState:UIControlStateNormal];
-    [scanBtn setTitleColor:[UIColor colorWithRed:1 green:0.39 blue:0.28 alpha:1] forState:UIControlStateNormal];
+    [scanBtn setTitle:@"Найти стамину" forState:UIControlStateNormal];
+    [scanBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [scanBtn addTarget:self action:@selector(doScan) forControlEvents:UIControlEventTouchUpInside];
     [self.panel addSubview:scanBtn];
 
-    g_logView = [[UITextView alloc] initWithFrame:CGRectMake(12, 170, panelW - 24, panelH - 180)];
-    g_logView.backgroundColor = [UIColor colorWithRed:0.02 green:0.02 blue:0.04 alpha:0.9];
-    g_logView.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.4 alpha:1];
+    g_logView = [[UITextView alloc] initWithFrame:CGRectMake(12, 165, panelW - 24, panelH - 175)];
+    g_logView.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.9];
+    g_logView.textColor = [UIColor colorWithWhite:0.8 alpha:1.0];
     g_logView.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:9];
     g_logView.editable = NO;
     g_logView.layer.cornerRadius = 6;
@@ -213,11 +185,11 @@ static void start_ticker(void) {
     [self.panel addSubview:g_logView];
 }
 
-- (void)doScan { find_player_structures(); }
+- (void)doScan { find_stamina(); }
 - (void)toggleMenu { self.menuOpen = !self.menuOpen; self.panel.hidden = !self.menuOpen; if (self.menuOpen) { CGRect b = self.floatingBtn.frame; self.panel.frame = CGRectMake(b.origin.x, b.origin.y + b.size.height + 10, 280, 250); } }
 - (void)handlePanBtn:(UIPanGestureRecognizer*)g { CGPoint t = [g translationInView:self]; self.floatingBtn.center = CGPointMake(self.floatingBtn.center.x + t.x, self.floatingBtn.center.y + t.y); [g setTranslation:CGPointZero inView:self]; if (self.menuOpen) { CGRect b = self.floatingBtn.frame; self.panel.frame = CGRectMake(b.origin.x, b.origin.y + b.size.height + 10, 280, 250); } }
 - (void)handlePanPanel:(UIPanGestureRecognizer*)g { CGPoint t = [g translationInView:self]; self.panel.center = CGPointMake(self.panel.center.x + t.x, self.panel.center.y + t.y); [g setTranslation:CGPointZero inView:self]; }
-- (void)toggleStamina:(UISwitch*)s { g_stamina = s.isOn ? 1 : 0; LogToMenu(@"[MENU] Stamina %@", s.isOn ? @"ON" : @"OFF"); if(g_stamina) apply_stamina(); }
+- (void)toggleStamina:(UISwitch*)s { g_stamina = s.isOn ? 1 : 0; LogToMenu(@"[MENU] НФТ бег %@", s.isOn ? @"ON" : @"OFF"); if(g_stamina) find_stamina(); }
 @end
 
 static MenuView *g_menu = nil;
@@ -230,15 +202,10 @@ static void attach_menu_to_game(void) {
         g_menu.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [gameWindow addSubview:g_menu];
         [gameWindow bringSubviewToFront:g_menu];
-        g_session_start = [[NSDate date] timeIntervalSince1970];
         
-        // Обновляем время каждую секунду
-        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
             if (g_statsLabel) {
-                NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:[NSDate dateWithTimeIntervalSince1970:g_session_start]];
-                int mins = (int)elapsed / 60;
-                int secs = (int)elapsed % 60;
-                g_statsLabel.text = [NSString stringWithFormat:@"ID: %d  |  ВСР: %02d:%02d", g_current_id, mins, secs];
+                g_statsLabel.text = [NSString stringWithFormat:@"ID: %d", g_current_id];
             }
         }];
     });
